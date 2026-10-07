@@ -8,7 +8,7 @@ import datetime as dt
 from mcp.server.mcpserver import MCPServer
 
 from . import accounts as acct
-from . import imap
+from . import audit, imap
 
 mcp = MCPServer("imap-mcp", version="0.1.0")
 
@@ -51,15 +51,28 @@ def list_accounts() -> list[dict]:
 
 
 @mcp.tool()
+def list_folders(account: str) -> list[str]:
+    """List the selectable folders of one account (INBOX, Sent, Archive, ...).
+
+    Use the names as `folder` in list_emails, search_emails, and get_email.
+    """
+    folders = imap.list_folders(acct.get_account(account))
+    audit.record("list_folders", {"account": account}, folders)
+    return folders
+
+
+@mcp.tool()
 def list_emails(
     account: str | None = None,
+    folder: str = "INBOX",
     since: str | None = None,
     unread_only: bool = False,
     limit: int = 25,
 ) -> list[dict]:
-    """List recent emails, newest first.
+    """List recent emails in one folder, newest first.
 
     account: account key (see list_accounts). Omit to merge ALL enabled accounts.
+    folder: folder name (see list_folders), default INBOX.
     since: ISO date (YYYY-MM-DD) lower bound, optional.
     unread_only: only unseen messages.
     limit: max rows (per account when merging).
@@ -68,10 +81,16 @@ def list_emails(
     rows: list[dict] = []
     for a in _targets(account):
         try:
-            rows.extend(imap.fetch_rows(a, since=since_d, unread_only=unread_only, limit=limit))
+            rows.extend(
+                imap.fetch_rows(
+                    a, folder=folder, since=since_d, unread_only=unread_only, limit=limit
+                )
+            )
         except Exception as e:  # noqa: BLE001 -- per-account fail-safe
             rows.append({"account": a.key, "error": f"{type(e).__name__}: {e}"})
-    rows.sort(key=lambda r: r.get("date") or "", reverse=True)
+    rows.sort(key=imap.date_key, reverse=True)
+    args = {"account": account, "folder": folder, "since": since, "unread_only": unread_only}
+    audit.record("list_emails", args | {"limit": limit}, rows)
     return rows
 
 
@@ -79,6 +98,7 @@ def list_emails(
 def search_emails(
     query: str,
     account: str | None = None,
+    folder: str | None = None,
     since: str | None = None,
     limit: int = 25,
 ) -> list[dict]:
@@ -86,6 +106,7 @@ def search_emails(
 
     query: free text; matched against sender, subject, and body (IMAP OR).
     account: omit to search ALL enabled accounts.
+    folder: folder name (see list_folders). Omit to search ALL folders.
     since: ISO date (YYYY-MM-DD) lower bound, optional.
     limit: max rows (per account when merging).
     """
@@ -93,24 +114,27 @@ def search_emails(
     rows: list[dict] = []
     for a in _targets(account):
         try:
-            rows.extend(imap.fetch_rows(a, query=query, since=since_d, limit=limit))
+            rows.extend(imap.fetch_rows(a, folder=folder, query=query, since=since_d, limit=limit))
         except Exception as e:  # noqa: BLE001
             rows.append({"account": a.key, "error": f"{type(e).__name__}: {e}"})
-    rows.sort(key=lambda r: r.get("date") or "", reverse=True)
+    rows.sort(key=imap.date_key, reverse=True)
+    args = {"query": query, "account": account, "folder": folder, "since": since}
+    audit.record("search_emails", args | {"limit": limit}, rows)
     return rows
 
 
 @mcp.tool()
-def get_email(account: str, id: str) -> dict:
+def get_email(account: str, id: str, folder: str = "INBOX") -> dict:
     """Fetch one full email (plain-text body preferred) by account + message id.
 
-    id is the value returned in list_emails/search_emails rows (IMAP UID).
-    Reading does not mark the message as read.
+    id and folder are the values returned in list_emails/search_emails rows
+    (IMAP UIDs are per folder). Reading does not mark the message as read.
     """
     a = acct.get_account(account)
-    msg = imap.fetch_one(a, id)
+    msg = imap.fetch_one(a, id, folder)
     if msg is None:
-        return {"account": account, "id": id, "error": "not found in INBOX"}
+        msg = {"account": account, "folder": folder, "id": id, "error": f"not found in {folder}"}
+    audit.record("get_email", {"account": account, "id": id, "folder": folder}, msg)
     return msg
 
 

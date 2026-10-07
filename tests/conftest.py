@@ -30,6 +30,12 @@ CONFIG = textwrap.dedent("""\
 """)
 
 
+@pytest.fixture(autouse=True)
+def no_audit_log(monkeypatch):
+    """Keep a developer's real IMAP_MCP_AUDIT_LOG out of the test run."""
+    monkeypatch.delenv("IMAP_MCP_AUDIT_LOG", raising=False)
+
+
 @pytest.fixture
 def config(tmp_path, monkeypatch):
     """Point the registry at a three-account test config (one disabled)."""

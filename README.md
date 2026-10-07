@@ -9,8 +9,10 @@ all my accounts?" or "find the invoice from Hetzner" and get answers that span
 providers, not one inbox at a time.
 
 **Strictly read-only.** No send, no delete, no flag changes, no folder moves.
-Every fetch uses `BODY.PEEK`, so reading a message never marks it as read.
-Your mailboxes look exactly the same after a session as before it.
+Every folder is opened with `EXAMINE` (read-only select), so the server itself
+refuses changes, and every fetch uses `BODY.PEEK`, so reading a message never
+marks it as read. Your mailboxes look exactly the same after a session as
+before it.
 
 **No secrets on disk.** The config file names an environment variable per
 account; passwords only ever exist in the server process environment. Bring
@@ -126,26 +128,43 @@ it tells you which mailboxes are queryable and what to pass as `account`.
 {"account": "personal", "email": "you@example.com", "enabled": true, "status": "ok"}
 ```
 
-**`list_emails(account?, since?, unread_only?, limit?)`** recent mail, newest
-first. Omit `account` to merge all enabled accounts into one timeline.
+**`list_folders(account)`** the selectable folders of one account (INBOX,
+Sent, Archive, ...). Use the names as `folder` in the other tools.
 
-**`search_emails(query, account?, since?, limit?)`** free-text search over
-sender, subject, and body. Also cross-account unless you name one.
+**`list_emails(account?, folder?, since?, unread_only?, limit?)`** recent mail
+in one folder (default `INBOX`), newest first. Omit `account` to merge all
+enabled accounts into one timeline.
+
+**`search_emails(query, account?, folder?, since?, limit?)`** free-text search
+over sender, subject, and body. Searches every folder unless you name one, and
+every account unless you name one. The all-folders search skips spam and
+virtual folders that repeat mail from elsewhere (Gmail All Mail, Starred,
+Important), drops duplicates by Message-ID, and fetches bodies only for the
+rows it returns.
 
 Both return compact rows:
 
 ```json
-{"account": "personal", "id": "4711", "from": "billing@hetzner.com",
+{"account": "personal", "folder": "INBOX", "id": "4711", "from": "billing@hetzner.com",
  "subject": "Invoice 2026-07", "date": "2026-07-03T09:12:44+00:00",
  "unread": true, "snippet": "Your invoice for July..."}
 ```
 
-**`get_email(account, id)`** one full message by the `id` from a row, with
-plain-text body preferred over HTML. Reading it does not mark it read.
+**`get_email(account, id, folder?)`** one full message by the `id` and
+`folder` from a row (IMAP UIDs are per folder), with plain-text body preferred
+over HTML. Reading it does not mark it read.
 
 Dates are ISO (`YYYY-MM-DD`); `since` filters everywhere; `limit` applies per
-account when merging. If one account is down, its error comes back as a row
-and the other accounts still answer.
+account when merging. If one account or folder is down, its error comes back
+as a row and the others still answer.
+
+## Audit log
+
+Set `IMAP_MCP_AUDIT_LOG` to an absolute path (the server's working directory
+depends on the MCP client), e.g. `/home/you/imap-mcp-audit.log`, to get one JSON line per mail tool
+call: time, tool, arguments, and the messages returned (account, folder, id,
+sender, subject, date). Bodies and snippets are never logged. Unset, nothing
+is written.
 
 ## Troubleshooting
 
@@ -164,9 +183,10 @@ and the other accounts still answer.
 uv run pytest
 ```
 
-31 tests, no network: the IMAP layer is faked. The suite locks in the
-read-only contract (`mark_seen=False` on every fetch), per-account error
-isolation, and config handling.
+47 tests, no network: the IMAP layer is faked. The suite locks in the
+read-only contract (read-only select and `mark_seen=False` on every fetch),
+per-account and per-folder error isolation, the audit log, and config
+handling.
 
 ## License
 
