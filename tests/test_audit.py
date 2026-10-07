@@ -69,3 +69,20 @@ def test_tools_write_audit_lines(config, tmp_path, monkeypatch):
     ]
     assert lines[2]["args"]["query"] == "invoice"
     assert lines[3]["messages"][0]["id"] == "7"
+
+
+def test_save_attachment_is_audited_without_contents(config, tmp_path, monkeypatch):
+    log = tmp_path / "audit.log"
+    monkeypatch.setenv("IMAP_MCP_AUDIT_LOG", str(log))
+    monkeypatch.setenv("IMAP_MCP_ATTACHMENT_DIR", str(tmp_path))
+    monkeypatch.setattr(
+        imap,
+        "save_attachment",
+        lambda *a: {"filename": "f.pdf", "path": "/x/f.pdf", "size": 3, "payload": "secret"},
+    )
+    server.save_attachment("alpha", "42", 0)
+    entry = json.loads(log.read_text(encoding="utf-8"))
+    assert entry["tool"] == "save_attachment"
+    assert entry["messages"][0]["filename"] == "f.pdf"
+    assert entry["messages"][0]["path"] == "/x/f.pdf"
+    assert "secret" not in log.read_text(encoding="utf-8")

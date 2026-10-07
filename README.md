@@ -152,7 +152,16 @@ Both return compact rows:
 
 **`get_email(account, id, folder?)`** one full message by the `id` and
 `folder` from a row (IMAP UIDs are per folder), with plain-text body preferred
-over HTML. Reading it does not mark it read.
+over HTML, plus an `attachments` list (index, filename, content type, size).
+Reading it does not mark it read.
+
+**`save_attachment(account, id, index, folder?)`** saves one attachment (by its
+`index` from `get_email`) into `IMAP_MCP_ATTACHMENT_DIR` (use an absolute path)
+and returns the file
+path, so the client can read it with its own file tools (PDFs, images, ...).
+Disabled unless that variable is set. Files land only in that directory, with a
+cleaned name prefixed by account, folder, id and index; nothing is opened or
+executed.
 
 Dates are ISO (`YYYY-MM-DD`); `since` filters everywhere; `limit` applies per
 account when merging. If one account or folder is down, its error comes back
@@ -163,7 +172,8 @@ as a row and the others still answer.
 Set `IMAP_MCP_AUDIT_LOG` to an absolute path (the server's working directory
 depends on the MCP client), e.g. `/home/you/imap-mcp-audit.log`, to get one JSON line per mail tool
 call: time, tool, arguments, and the messages returned (account, folder, id,
-sender, subject, date). Bodies and snippets are never logged. Unset, nothing
+sender, subject, date; for saved attachments the file name and path). Bodies,
+snippets and attachment contents are never logged. Unset, nothing
 is written.
 
 ## Troubleshooting
@@ -183,7 +193,7 @@ is written.
 uv run pytest
 ```
 
-47 tests, no network: the IMAP layer is faked. The suite locks in the
+81 tests, no network: the IMAP layer is faked. The suite locks in the
 read-only contract (read-only select and `mark_seen=False` on every fetch),
 per-account and per-folder error isolation, the audit log, and config
 handling.

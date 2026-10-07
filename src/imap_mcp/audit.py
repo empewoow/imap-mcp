@@ -2,7 +2,8 @@
 
 When IMAP_MCP_AUDIT_LOG names a file, every mail tool call appends one JSON
 line: time, tool, arguments, and the messages it returned (account, folder, id,
-sender, subject, date). Message bodies and snippets are never logged.
+sender, subject, date; for saved attachments the file name and path).
+Message bodies, snippets and attachment contents are never logged.
 """
 
 from __future__ import annotations
@@ -13,7 +14,7 @@ import os
 from contextlib import suppress
 from pathlib import Path
 
-_FIELDS = ("account", "folder", "id", "from", "subject", "date", "error")
+_FIELDS = ("account", "folder", "id", "from", "subject", "date", "filename", "path", "error")
 
 
 def record(tool: str, args: dict, result: object) -> None:

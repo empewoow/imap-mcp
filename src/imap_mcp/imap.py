@@ -8,9 +8,13 @@ imap-tools issues BODY.PEEK and reading a message never sets the \\Seen flag.
 from __future__ import annotations
 
 import datetime as dt
+import os
+import re
+import tempfile
 from collections import defaultdict
 from collections.abc import Iterator
 from contextlib import contextmanager, suppress
+from pathlib import Path
 
 from imap_tools import AND, OR, MailBox
 
@@ -25,6 +29,9 @@ _UNSELECTABLE = {"\\noselect", "\\nonexistent"}
 _SKIP_IN_ALL = {"\\all", "\\flagged", "\\important", "\\junk"}
 
 _EPOCH = dt.datetime.min.replace(tzinfo=dt.UTC)
+
+# Characters kept in saved attachment file names; everything else becomes "_".
+_UNSAFE_NAME_CHARS = re.compile(r"[^A-Za-z0-9._() -]")
 
 
 @contextmanager
@@ -190,23 +197,109 @@ def fetch_rows(
     return rows + errors
 
 
+def _attachment_list(msg) -> list[dict]:
+    return [
+        {"index": i, "filename": a.filename, "content_type": a.content_type, "size": a.size}
+        for i, a in enumerate(msg.attachments)
+    ]
+
+
+def check_uid(uid: str) -> None:
+    """Reject anything but a single numeric UID (no ranges, lists or `*`)."""
+    if not re.fullmatch(r"[0-9]+", uid):
+        raise ValueError(f"id must be a single numeric IMAP UID, got {uid!r}")
+
+
+def _fetch_message(account: Account, uid: str, folder: str):
+    check_uid(uid)
+    with open_box(account, folder=folder) as box:
+        return next(iter(box.fetch(AND(uid=uid), mark_seen=False, bulk=False, limit=1)), None)
+
+
+def _name_part(text: str, max_len: int) -> str:
+    """One piece of a file name: unsafe characters (including / and \\) become _."""
+    return _UNSAFE_NAME_CHARS.sub("_", text)[:max_len]
+
+
+def safe_filename(name: str | None, max_len: int = 120) -> str:
+    """A plain file name: no directories, no characters outside a small safe
+    set, at most max_len characters with the extension kept."""
+    base = (name or "").replace("\\", "/").rsplit("/", 1)[-1]
+    base = _UNSAFE_NAME_CHARS.sub("_", base).strip(" .")
+    if not base:
+        return "attachment"
+    if len(base) > max_len:
+        suffix = Path(base).suffix[:16]
+        base = base[: max_len - len(suffix)].rstrip(" .") + suffix
+    return base
+
+
+def save_attachment(
+    account: Account, uid: str, index: int, folder: str, dest_dir: Path
+) -> dict | None:
+    """Write attachment `index` of a message into dest_dir. Returns None if the
+    message is not found; raises IndexError for a bad index.
+
+    The file name is built from account, folder, uid and index plus the cleaned
+    original name, and is checked to resolve inside dest_dir. Nothing is opened
+    or executed.
+    """
+    m = _fetch_message(account, uid, folder)
+    if m is None:
+        return None
+    attachments = list(m.attachments)
+    if not 0 <= index < len(attachments):
+        raise IndexError(
+            f"message has {len(attachments)} attachment(s); index {index} is out of range"
+        )
+    att = attachments[index]
+    dest_dir = dest_dir.resolve()
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    prefix = f"{_name_part(account.key, 40)}-{_name_part(folder, 60)}-{m.uid}-{index}"
+    # Not resolved: the name has no separators, and a link at that name must
+    # be replaced by os.replace below, not followed.
+    path = dest_dir / f"{prefix}-{safe_filename(att.filename, 80)}"
+    if path.parent != dest_dir:
+        raise ValueError("attachment path escapes the attachment directory")
+    # Write a temp file and rename it over the target, so an existing link at
+    # that name is replaced instead of written through.
+    fd, tmp = tempfile.mkstemp(dir=dest_dir, prefix=".part-")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(att.payload)
+        os.replace(tmp, path)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp)
+        raise
+    return {
+        "account": account.key,
+        "folder": folder,
+        "id": m.uid,
+        "index": index,
+        "filename": att.filename,
+        "content_type": att.content_type,
+        "size": len(att.payload),
+        "path": str(path),
+    }
+
+
 def fetch_one(account: Account, uid: str, folder: str = "INBOX") -> dict | None:
     """Full message by UID in `folder`. Returns None if not found."""
-    with open_box(account, folder=folder) as box:
-        msgs = list(box.fetch(AND(uid=uid), mark_seen=False, bulk=False))
-        if not msgs:
-            return None
-        m = msgs[0]
-        return {
-            "account": account.key,
-            "folder": folder,
-            "id": m.uid,
-            "from": m.from_,
-            "to": list(m.to),
-            "cc": list(m.cc),
-            "subject": m.subject,
-            "date": m.date.isoformat() if m.date else None,
-            "unread": "\\Seen" not in m.flags,
-            "message_id": _message_id(m),
-            "body": (m.text or m.html or "").strip(),
-        }
+    m = _fetch_message(account, uid, folder)
+    if m is None:
+        return None
+    return {
+        "account": account.key,
+        "folder": folder,
+        "id": m.uid,
+        "from": m.from_,
+        "to": list(m.to),
+        "cc": list(m.cc),
+        "subject": m.subject,
+        "date": m.date.isoformat() if m.date else None,
+        "unread": "\\Seen" not in m.flags,
+        "message_id": _message_id(m),
+        "body": (m.text or m.html or "").strip(),
+        "attachments": _attachment_list(m),
+    }

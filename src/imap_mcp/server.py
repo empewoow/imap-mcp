@@ -4,6 +4,8 @@ mailboxes and exposes list/get/search tools to an MCP client."""
 from __future__ import annotations
 
 import datetime as dt
+import os
+from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
 
@@ -17,6 +19,14 @@ def _parse_since(since: str | None) -> dt.date | None:
     if not since:
         return None
     return dt.date.fromisoformat(since)  # raises ValueError on bad input
+
+
+def _enabled(account: str) -> acct.Account:
+    """The named account, refusing disabled ones."""
+    a = acct.get_account(account)
+    if not a.enabled:
+        raise PermissionError(f"account {account!r} is disabled")
+    return a
 
 
 def _targets(account: str | None) -> list[acct.Account]:
@@ -56,7 +66,7 @@ def list_folders(account: str) -> list[str]:
 
     Use the names as `folder` in list_emails, search_emails, and get_email.
     """
-    folders = imap.list_folders(acct.get_account(account))
+    folders = imap.list_folders(_enabled(account))
     audit.record("list_folders", {"account": account}, folders)
     return folders
 
@@ -130,12 +140,40 @@ def get_email(account: str, id: str, folder: str = "INBOX") -> dict:
     id and folder are the values returned in list_emails/search_emails rows
     (IMAP UIDs are per folder). Reading does not mark the message as read.
     """
-    a = acct.get_account(account)
+    a = _enabled(account)
+    imap.check_uid(id)
     msg = imap.fetch_one(a, id, folder)
     if msg is None:
         msg = {"account": account, "folder": folder, "id": id, "error": f"not found in {folder}"}
     audit.record("get_email", {"account": account, "id": id, "folder": folder}, msg)
     return msg
+
+
+@mcp.tool()
+def save_attachment(account: str, id: str, index: int, folder: str = "INBOX") -> dict:
+    """Save one attachment of an email to the local attachment directory.
+
+    id, folder: as returned in list_emails/search_emails rows. index: the
+    attachment's index from get_email's "attachments" list. Returns the saved
+    file's path; read it with your own file tools. Only works when
+    IMAP_MCP_ATTACHMENT_DIR is set. Nothing is opened or executed, and the
+    mailbox is not changed.
+    """
+    args = {"account": account, "id": id, "index": index, "folder": folder}
+    dest = os.environ.get("IMAP_MCP_ATTACHMENT_DIR")
+    if not dest:
+        out = {"error": "attachment saving is disabled (IMAP_MCP_ATTACHMENT_DIR is not set)"}
+    else:
+        try:
+            a = _enabled(account)
+            out = imap.save_attachment(a, id, index, folder, Path(dest).expanduser())
+            if out is None:
+                out = {"error": f"not found in {folder}"}
+        except Exception as e:  # noqa: BLE001 -- report and audit every failure
+            out = {"error": f"{type(e).__name__}: {e}"}
+    out = {"account": account, "folder": folder, "id": id} | out
+    audit.record("save_attachment", args, out)
+    return out
 
 
 def main() -> None:

@@ -1,4 +1,5 @@
 import datetime as dt
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -83,6 +84,7 @@ def fake_msg(**overrides):
         text="line one\nline two",
         html="",
         headers={"message-id": ["<abc@example.com>"]},
+        attachments=(),
     )
     base.update(overrides)
     return SimpleNamespace(**base)
@@ -323,6 +325,7 @@ def test_fetch_one_full_message(config, monkeypatch):
         "unread": False,
         "message_id": "<abc@example.com>",
         "body": "line one\nline two",
+        "attachments": [],
     }
     box = FakeMailBox.instances[-1]
     assert box.folder.selected == [("Sent", True)]
@@ -333,3 +336,185 @@ def test_fetch_one_not_found(config, monkeypatch):
     monkeypatch.setenv("ALPHA_PW", "pw")
     FakeMailBox.messages = []
     assert imap.fetch_one(accounts.get_account("alpha"), "42") is None
+
+
+def att(filename, payload=b"data", content_type="application/pdf"):
+    return SimpleNamespace(
+        filename=filename, content_type=content_type, size=len(payload), payload=payload
+    )
+
+
+def test_fetch_one_lists_attachments(config, monkeypatch):
+    monkeypatch.setenv("ALPHA_PW", "pw")
+    FakeMailBox.messages = [fake_msg(attachments=(att("spec.pdf", b"12345"), att("logo.png")))]
+    msg = imap.fetch_one(accounts.get_account("alpha"), "42")
+    assert msg["attachments"] == [
+        {"index": 0, "filename": "spec.pdf", "content_type": "application/pdf", "size": 5},
+        {"index": 1, "filename": "logo.png", "content_type": "application/pdf", "size": 4},
+    ]
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("spec v2.pdf", "spec v2.pdf"),
+        ("../../evil.exe", "evil.exe"),
+        ("..\\..\\evil.bat", "evil.bat"),
+        ("a<b>:c|d?.pdf", "a_b__c_d_.pdf"),
+        ("...", "attachment"),
+        (None, "attachment"),
+    ],
+)
+def test_safe_filename(name, expected):
+    assert imap.safe_filename(name) == expected
+
+
+def test_save_attachment_writes_inside_dir(config, monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPHA_PW", "pw")
+    dest = tmp_path / "attachments"
+    FakeMailBox.messages = [fake_msg(attachments=(att("x.txt"), att("../../evil.exe", b"MZ")))]
+    out = imap.save_attachment(accounts.get_account("alpha"), "42", 1, "Sent", dest)
+
+    path = dest / "alpha-Sent-42-1-evil.exe"
+    assert out["path"] == str(path.resolve())
+    assert path.read_bytes() == b"MZ"
+    assert [p.name for p in dest.iterdir()] == ["alpha-Sent-42-1-evil.exe"]
+    assert (out["filename"], out["size"], out["index"]) == ("../../evil.exe", 2, 1)
+    box = FakeMailBox.instances[-1]
+    assert box.folder.selected == [("Sent", True)]
+    assert box.fetch_kwargs["mark_seen"] is False
+
+
+def test_save_attachment_folder_name_cannot_escape(config, monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPHA_PW", "pw")
+    dest = tmp_path / "attachments"
+    FakeMailBox.messages = [fake_msg(attachments=(att("a.pdf"),))]
+    out = imap.save_attachment(accounts.get_account("alpha"), "42", 0, "../../x", dest)
+    assert Path(out["path"]).parent == dest.resolve()
+
+
+def test_save_attachment_bad_index(config, monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPHA_PW", "pw")
+    dest = tmp_path / "attachments"
+    FakeMailBox.messages = [fake_msg(attachments=(att("a.pdf"),))]
+    with pytest.raises(IndexError, match="1 attachment"):
+        imap.save_attachment(accounts.get_account("alpha"), "42", 3, "INBOX", dest)
+    assert not dest.exists()
+
+
+def test_save_attachment_not_found(config, monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPHA_PW", "pw")
+    FakeMailBox.messages = []
+    assert imap.save_attachment(accounts.get_account("alpha"), "42", 0, "INBOX", tmp_path) is None
+
+
+def test_save_attachment_keeps_account_and_full_folder(config, monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPHA_PW", "pw")
+    monkeypatch.setenv("BETA_PW", "pw")
+    dest = tmp_path / "attachments"
+    FakeMailBox.messages = [fake_msg(attachments=(att("a.pdf"),))]
+    one = imap.save_attachment(accounts.get_account("alpha"), "42", 0, "[Gmail]/Sent Mail", dest)
+    two = imap.save_attachment(accounts.get_account("gmailish"), "42", 0, "[Gmail]/Sent Mail", dest)
+    assert Path(one["path"]).name == "alpha-_Gmail__Sent Mail-42-0-a.pdf"
+    assert Path(two["path"]).name == "gmailish-_Gmail__Sent Mail-42-0-a.pdf"
+
+
+def test_safe_filename_keeps_extension_when_truncating():
+    name = imap.safe_filename("y" * 300 + ".pdf", 80)
+    assert len(name) == 80 and name.endswith(".pdf")
+
+
+def test_save_attachment_long_folder_keeps_uid_and_index(config, monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPHA_PW", "pw")
+    FakeMailBox.messages = [fake_msg(attachments=(att("a.pdf"),))]
+    out = imap.save_attachment(
+        accounts.get_account("alpha"), "42", 0, "F" * 300, tmp_path / "attachments"
+    )
+    assert Path(out["path"]).name == "alpha-" + "F" * 60 + "-42-0-a.pdf"
+
+
+@pytest.mark.parametrize("uid", ["1:*", "*", "42,43", "", "-1", "4 2", "²", "١٢"])
+def test_uid_must_be_single_number(config, monkeypatch, tmp_path, uid):
+    monkeypatch.setenv("ALPHA_PW", "pw")
+    with pytest.raises(ValueError, match="numeric"):
+        imap.fetch_one(accounts.get_account("alpha"), uid)
+    with pytest.raises(ValueError, match="numeric"):
+        imap.save_attachment(accounts.get_account("alpha"), uid, 0, "INBOX", tmp_path)
+    assert FakeMailBox.instances == []  # never even connected
+
+
+def test_save_attachment_fetches_one_message(config, monkeypatch, tmp_path):
+    monkeypatch.setenv("ALPHA_PW", "pw")
+    FakeMailBox.messages = [fake_msg(attachments=(att("a.pdf"),))]
+    imap.save_attachment(accounts.get_account("alpha"), "42", 0, "INBOX", tmp_path / "a")
+    assert FakeMailBox.instances[-1].fetch_kwargs["limit"] == 1
+
+
+def test_save_attachment_replaces_existing_link(config, monkeypatch, tmp_path):
+    import os
+
+    monkeypatch.setenv("ALPHA_PW", "pw")
+    dest = tmp_path / "attachments"
+    dest.mkdir()
+    outside = tmp_path / "important.txt"
+    outside.write_bytes(b"keep me")
+    os.link(outside, dest / "alpha-INBOX-42-0-a.pdf")
+    FakeMailBox.messages = [fake_msg(attachments=(att("a.pdf", b"new"),))]
+    imap.save_attachment(accounts.get_account("alpha"), "42", 0, "INBOX", dest)
+    assert outside.read_bytes() == b"keep me"
+    assert (dest / "alpha-INBOX-42-0-a.pdf").read_bytes() == b"new"
+    assert [p.name for p in dest.iterdir()] == ["alpha-INBOX-42-0-a.pdf"]  # no temp left
+
+
+RAW_EML = (
+    b"From: a@example.com\r\nTo: b@example.com\r\nSubject: s\r\nMIME-Version: 1.0\r\n"
+    b'Content-Type: multipart/mixed; boundary="B"\r\n\r\n'
+    b"--B\r\nContent-Type: text/plain\r\n\r\nhello\r\n"
+    b'--B\r\nContent-Type: application/pdf; name="spec.pdf"\r\n'
+    b'Content-Disposition: attachment; filename="spec.pdf"\r\n'
+    b"Content-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQ=\r\n"
+    b"--B\r\nContent-Type: image/png\r\nContent-ID: <logo>\r\n"
+    b"Content-Transfer-Encoding: base64\r\n\r\niVBORw==\r\n"
+    b"--B--\r\n"
+)
+
+
+def test_attachment_list_from_real_message():
+    from imap_tools import MailMessage
+
+    listed = imap._attachment_list(MailMessage.from_bytes(RAW_EML))
+    assert [(a["index"], a["filename"], a["content_type"]) for a in listed] == [
+        (0, "spec.pdf", "application/pdf"),
+        (1, "", "image/png"),  # inline part without a name
+    ]
+    assert listed[0]["size"] == len(b"%PDF-1.4")
+
+
+def test_save_unnamed_attachment_gets_a_name(config, monkeypatch, tmp_path):
+    from imap_tools import MailMessage
+
+    monkeypatch.setenv("ALPHA_PW", "pw")
+    real = MailMessage.from_bytes(RAW_EML)
+    FakeMailBox.messages = [fake_msg(attachments=tuple(real.attachments))]
+    out = imap.save_attachment(accounts.get_account("alpha"), "42", 1, "INBOX", tmp_path / "a")
+    assert Path(out["path"]).name == "alpha-INBOX-42-1-attachment"
+    assert Path(out["path"]).read_bytes().startswith(b"\x89PNG")
+
+
+def test_save_attachment_replaces_symlink_instead_of_following(config, monkeypatch, tmp_path):
+    import os
+
+    monkeypatch.setenv("ALPHA_PW", "pw")
+    dest = tmp_path / "attachments"
+    dest.mkdir()
+    other = dest / "other.txt"
+    other.write_bytes(b"keep me")
+    try:
+        os.symlink(other, dest / "alpha-INBOX-42-0-a.pdf")
+    except OSError:
+        pytest.skip("creating symlinks needs extra rights on this system")
+    FakeMailBox.messages = [fake_msg(attachments=(att("a.pdf", b"new"),))]
+    out = imap.save_attachment(accounts.get_account("alpha"), "42", 0, "INBOX", dest)
+    assert other.read_bytes() == b"keep me"
+    assert Path(out["path"]).name == "alpha-INBOX-42-0-a.pdf"
+    assert not Path(out["path"]).is_symlink()

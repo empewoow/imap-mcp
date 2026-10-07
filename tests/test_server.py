@@ -155,4 +155,84 @@ def test_all_tools_registered():
     import asyncio
 
     tools = {t.name for t in asyncio.run(server.mcp.list_tools())}
-    assert tools == {"list_accounts", "list_folders", "list_emails", "search_emails", "get_email"}
+    assert tools == {
+        "list_accounts",
+        "list_folders",
+        "list_emails",
+        "search_emails",
+        "get_email",
+        "save_attachment",
+    }
+
+
+def test_save_attachment_disabled_without_dir(config, monkeypatch):
+    monkeypatch.delenv("IMAP_MCP_ATTACHMENT_DIR", raising=False)
+    called = []
+    monkeypatch.setattr(imap, "save_attachment", lambda *a: called.append(a))
+    out = server.save_attachment("alpha", "42", 0)
+    assert "disabled" in out["error"]
+    assert called == []
+
+
+def test_save_attachment_uses_dir(config, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMAP_MCP_ATTACHMENT_DIR", str(tmp_path))
+    seen = {}
+
+    def save(a, uid, index, folder, dest):
+        seen.update(account=a.key, uid=uid, index=index, folder=folder, dest=dest)
+        return {"path": str(dest / "f.pdf"), "filename": "f.pdf"}
+
+    monkeypatch.setattr(imap, "save_attachment", save)
+    out = server.save_attachment("alpha", "42", 1, "Sent")
+    assert seen == {"account": "alpha", "uid": "42", "index": 1, "folder": "Sent", "dest": tmp_path}
+    assert out["path"] == str(tmp_path / "f.pdf")
+    assert (out["account"], out["folder"], out["id"]) == ("alpha", "Sent", "42")
+
+
+def test_save_attachment_errors(config, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMAP_MCP_ATTACHMENT_DIR", str(tmp_path))
+
+    def bad_index(*a):
+        raise IndexError("index 3 is out of range")
+
+    monkeypatch.setattr(imap, "save_attachment", bad_index)
+    out = server.save_attachment("alpha", "42", 3)
+    assert out["error"] == "IndexError: index 3 is out of range"
+    monkeypatch.setattr(imap, "save_attachment", lambda *a: None)
+    assert server.save_attachment("alpha", "42", 0, "Sent")["error"] == "not found in Sent"
+
+
+def test_disabled_account_is_refused(config, monkeypatch, tmp_path):
+    monkeypatch.setenv("IMAP_MCP_ATTACHMENT_DIR", str(tmp_path))
+    called = []
+    monkeypatch.setattr(imap, "save_attachment", lambda *a: called.append(a))
+    monkeypatch.setattr(imap, "fetch_one", lambda *a: called.append(a))
+    monkeypatch.setattr(imap, "list_folders", lambda *a: called.append(a))
+    assert "disabled" in server.save_attachment("off", "42", 0)["error"]
+    with pytest.raises(PermissionError):
+        server.get_email("off", "42")
+    with pytest.raises(PermissionError):
+        server.list_folders("off")
+    assert called == []
+
+
+def test_get_email_rejects_uid_ranges(config, monkeypatch):
+    monkeypatch.setattr(imap, "fetch_one", lambda *a: pytest.fail("must not fetch"))
+    with pytest.raises(ValueError, match="numeric"):
+        server.get_email("alpha", "1:*")
+
+
+def test_save_attachment_os_error_is_reported_and_audited(config, monkeypatch, tmp_path):
+    import json
+
+    log = tmp_path / "audit.log"
+    monkeypatch.setenv("IMAP_MCP_AUDIT_LOG", str(log))
+    monkeypatch.setenv("IMAP_MCP_ATTACHMENT_DIR", str(tmp_path))
+
+    def too_long(*a):
+        raise FileNotFoundError("path too long")
+
+    monkeypatch.setattr(imap, "save_attachment", too_long)
+    out = server.save_attachment("alpha", "42", 0)
+    assert out["error"] == "FileNotFoundError: path too long"
+    assert json.loads(log.read_text(encoding="utf-8"))["messages"][0]["error"] == out["error"]
